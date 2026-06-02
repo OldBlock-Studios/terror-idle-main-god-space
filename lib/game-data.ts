@@ -109,9 +109,55 @@ export interface Formation {
 }
 
 export interface BestiaryEntry {
-  monsterId: string     // key = world.id + "_" + zone style
+  monsterId: string
   name: string
   kills: number
+}
+
+export interface BlackMarketOffer {
+  id: string
+  name: string
+  desc: string
+  fromCurrency: "rp" | "rank" | "gene" | "souls" | "void"
+  fromAmount: number
+  toCurrency: "rp" | "rank" | "gene" | "souls" | "void"
+  toAmount: number
+  maxTrades: number   // per refresh
+}
+
+export interface Equipment {
+  id: string
+  name: string
+  desc: string
+  slot: "weapon" | "armor" | "accessory"
+  heroId: string      // which hero it buffs, or "global"
+  dpsMult: number     // 1 = no bonus
+  clickMult: number
+  rpMult: number
+  rarity: "common" | "rare" | "epic" | "legendary"
+  dropZone: number    // min zone to drop
+}
+
+export interface TalentNode {
+  id: string
+  name: string
+  desc: string
+  cost: number        // in talent points
+  maxRank: number
+  requires: string[]  // node ids required before unlocking
+  x: number           // grid position for rendering
+  y: number
+  effect: "dps_pct" | "click_pct" | "rp_pct" | "souls_pct" | "boss_dmg" | "crit_chance" | "crit_mult" | "offline_pct" | "all_pct"
+  effectPerRank: number
+}
+
+export interface DailyLoginReward {
+  day: number
+  rp: number
+  souls: number
+  gene: number
+  rank: number
+  desc: string
 }
 
 export interface GameState {
@@ -210,6 +256,32 @@ export interface GameState {
   bloodlineOfflinePct: number
   bloodlineCritChance: number
   bloodlineCritMult: number
+
+  // ── Equipment
+  equippedItems: Record<string, string>   // heroId -> equipmentId
+  equipmentOwned: Set<string>
+
+  // ── Talent Tree
+  talentPoints: number
+  talentRanks: Record<string, number>     // nodeId -> rank
+
+  // ── Daily Login
+  lastLoginDate: string    // ISO date string YYYY-MM-DD
+  loginStreak: number
+  loginRewardsClaimed: Set<string>  // "day_N"
+
+  // ── Black Market
+  blackMarketRefreshes: number
+  blackMarketTradesLeft: Record<string, number>  // offerId -> trades remaining
+  lastMarketRefresh: number  // timestamp
+
+  // ── Notifications log
+  notifications: Array<{ id: number; text: string; type: string; ts: number }>
+
+  // ── Challenge active state
+  challengeActive: boolean
+  challengeStartZone: number
+  challengeTargetZone: number
 
   // ── Lifetime
   totalClicks: number
@@ -599,8 +671,95 @@ export const BLESSINGS: Blessing[] = [
 ]
 
 // ────────────────────────────────────────────────────────────────────
-//  UTILITY FUNCTIONS
+//  BLACK MARKET
 // ────────────────────────────────────────────────────────────────────
+
+export const BLACK_MARKET: BlackMarketOffer[] = [
+  { id: "bm1",  name: "Converter Rank → Gene",      desc: "Taxa ruim mas útil",           fromCurrency: "rank",  fromAmount: 100,  toCurrency: "gene",   toAmount: 1,    maxTrades: 5  },
+  { id: "bm2",  name: "Converter Gene → Souls",      desc: "Desperdício calculado",        fromCurrency: "gene",  fromAmount: 50,   toCurrency: "souls",  toAmount: 1,    maxTrades: 3  },
+  { id: "bm3",  name: "Converter RP → Rank",         desc: "Trocar progresso por moeda",   fromCurrency: "rp",    fromAmount: 1e6,  toCurrency: "rank",   toAmount: 1,    maxTrades: 10 },
+  { id: "bm4",  name: "Souls → Gene (premium)",      desc: "Almas valem mais aqui",        fromCurrency: "souls", fromAmount: 5,    toCurrency: "gene",   toAmount: 20,   maxTrades: 2  },
+  { id: "bm5",  name: "Void → Gene (direto)",        desc: "Essência do Vazio é poderosa", fromCurrency: "void",  fromAmount: 1,    toCurrency: "gene",   toAmount: 50,   maxTrades: 2  },
+  { id: "bm6",  name: "Rank → Souls (emergência)",   desc: "Custo altíssimo",              fromCurrency: "rank",  fromAmount: 500,  toCurrency: "souls",  toAmount: 1,    maxTrades: 2  },
+  { id: "bm7",  name: "Gene → Rank (estoque)",       desc: "Vender Genes por Rank",        fromCurrency: "gene",  fromAmount: 10,   toCurrency: "rank",   toAmount: 50,   maxTrades: 5  },
+  { id: "bm8",  name: "RP em massa → Gene",          desc: "Volume compensa a taxa",       fromCurrency: "rp",    fromAmount: 10e6, toCurrency: "gene",   toAmount: 5,    maxTrades: 5  },
+]
+
+// ────────────────────────────────────────────────────────────────────
+//  EQUIPMENT  (dropped from bosses)
+// ────────────────────────────────────────────────────────────────────
+
+export const EQUIPMENT: Equipment[] = [
+  // Common
+  { id: "eq1",  name: "Faca Enferrujada",      desc: "Portador: +20% DPS",          slot: "weapon",    heroId: "h0",  dpsMult: 1.2,  clickMult: 1.0, rpMult: 1.0, rarity: "common",    dropZone: 1   },
+  { id: "eq2",  name: "Capuz Surrado",          desc: "Portador: +15% clique",       slot: "armor",     heroId: "h0",  dpsMult: 1.0,  clickMult: 1.15,rpMult: 1.0, rarity: "common",    dropZone: 5   },
+  { id: "eq3",  name: "Amuleto Barato",         desc: "+10% RP global",              slot: "accessory", heroId: "global",dpsMult:1.0, clickMult:1.0,  rpMult: 1.1, rarity: "common",    dropZone: 10  },
+  { id: "eq4",  name: "Rifle Polido",           desc: "Francoatiradora: +30% DPS",   slot: "weapon",    heroId: "h1",  dpsMult: 1.3,  clickMult: 1.0, rpMult: 1.0, rarity: "common",    dropZone: 15  },
+  { id: "eq5",  name: "Kit Médico+",            desc: "Médico: +25% DPS",            slot: "armor",     heroId: "h2",  dpsMult: 1.25, clickMult: 1.0, rpMult: 1.0, rarity: "common",    dropZone: 20  },
+  // Rare
+  { id: "eq6",  name: "Lâmina Sombria",         desc: "Portador: +50% clique",       slot: "weapon",    heroId: "h0",  dpsMult: 1.0,  clickMult: 1.5, rpMult: 1.0, rarity: "rare",      dropZone: 30  },
+  { id: "eq7",  name: "Armadura Espectral",     desc: "+25% DPS global",             slot: "armor",     heroId: "global",dpsMult:1.25,clickMult:1.0,  rpMult: 1.0, rarity: "rare",      dropZone: 50  },
+  { id: "eq8",  name: "Anel de Sangue",         desc: "+20% RP + +20% clique",       slot: "accessory", heroId: "global",dpsMult:1.0, clickMult:1.2,  rpMult: 1.2, rarity: "rare",      dropZone: 75  },
+  { id: "eq9",  name: "Espada de Runa",         desc: "Mago: +60% DPS",              slot: "weapon",    heroId: "h6",  dpsMult: 1.6,  clickMult: 1.0, rpMult: 1.0, rarity: "rare",      dropZone: 100 },
+  { id: "eq10", name: "Escudo Demoníaco",       desc: "Tanque: +50% DPS",            slot: "armor",     heroId: "h4",  dpsMult: 1.5,  clickMult: 1.0, rpMult: 1.0, rarity: "rare",      dropZone: 120 },
+  // Epic
+  { id: "eq11", name: "Tiger Soul Blade",       desc: "Portador: +100% clique",      slot: "weapon",    heroId: "h0",  dpsMult: 1.0,  clickMult: 2.0, rpMult: 1.0, rarity: "epic",      dropZone: 150 },
+  { id: "eq12", name: "Égide Eterna",           desc: "+50% DPS global",             slot: "armor",     heroId: "global",dpsMult:1.5, clickMult:1.0,  rpMult: 1.0, rarity: "epic",      dropZone: 200 },
+  { id: "eq13", name: "Orbe do Main God",       desc: "+50% RP + +30% DPS global",  slot: "accessory", heroId: "global",dpsMult:1.3, clickMult:1.0,  rpMult: 1.5, rarity: "epic",      dropZone: 250 },
+  { id: "eq14", name: "Lança do Julgamento",    desc: "Portador: +150% clique",      slot: "weapon",    heroId: "h0",  dpsMult: 1.0,  clickMult: 2.5, rpMult: 1.0, rarity: "epic",      dropZone: 300 },
+  { id: "eq15", name: "Armadura do Anjo Caído", desc: "Anjo: +100% DPS",             slot: "armor",     heroId: "h9",  dpsMult: 2.0,  clickMult: 1.0, rpMult: 1.0, rarity: "epic",      dropZone: 350 },
+  // Legendary
+  { id: "eq16", name: "Espada Divina",          desc: "+200% clique + +100% DPS",    slot: "weapon",    heroId: "global",dpsMult:2.0, clickMult:3.0,  rpMult: 1.0, rarity: "legendary", dropZone: 400 },
+  { id: "eq17", name: "Coroa do Deus Principal",desc: "+100% tudo global",           slot: "accessory", heroId: "global",dpsMult:2.0, clickMult:2.0,  rpMult: 2.0, rarity: "legendary", dropZone: 500 },
+  { id: "eq18", name: "Fragmento do Infinito",  desc: "+300% DPS global",            slot: "armor",     heroId: "global",dpsMult:4.0, clickMult:1.0,  rpMult: 1.0, rarity: "legendary", dropZone: 600 },
+]
+
+// ────────────────────────────────────────────────────────────────────
+//  TALENT TREE  (permanent, bought with talent points)
+//  Talent points: 1 per prestige cycle + 1 per 100 zones reached
+// ────────────────────────────────────────────────────────────────────
+
+export const TALENT_TREE: TalentNode[] = [
+  // Row 0 - starters
+  { id: "t1",  name: "Força Interior",      desc: "+10% clique por rank",    cost: 1, maxRank: 5,  requires: [],            x: 2, y: 0, effect: "click_pct",   effectPerRank: 0.10 },
+  { id: "t2",  name: "Poder Passivo",       desc: "+10% DPS por rank",       cost: 1, maxRank: 5,  requires: [],            x: 4, y: 0, effect: "dps_pct",     effectPerRank: 0.10 },
+  { id: "t3",  name: "Ganância",            desc: "+10% RP por rank",        cost: 1, maxRank: 5,  requires: [],            x: 6, y: 0, effect: "rp_pct",      effectPerRank: 0.10 },
+  // Row 1
+  { id: "t4",  name: "Reflexos de Combate", desc: "+15% clique por rank",    cost: 2, maxRank: 5,  requires: ["t1"],        x: 1, y: 1, effect: "click_pct",   effectPerRank: 0.15 },
+  { id: "t5",  name: "Aura de Poder",       desc: "+15% DPS por rank",       cost: 2, maxRank: 5,  requires: ["t2"],        x: 4, y: 1, effect: "dps_pct",     effectPerRank: 0.15 },
+  { id: "t6",  name: "Alma do Caçador",     desc: "+15% RP por rank",        cost: 2, maxRank: 5,  requires: ["t3"],        x: 7, y: 1, effect: "rp_pct",      effectPerRank: 0.15 },
+  { id: "t7",  name: "Foco Crítico",        desc: "+3% chance crit por rank",cost: 2, maxRank: 5,  requires: ["t1","t2"],   x: 3, y: 1, effect: "crit_chance", effectPerRank: 0.03 },
+  { id: "t8",  name: "Almas Extras",        desc: "+15% Souls por rank",     cost: 2, maxRank: 5,  requires: ["t2","t3"],   x: 5, y: 1, effect: "souls_pct",   effectPerRank: 0.15 },
+  // Row 2
+  { id: "t9",  name: "White Flame",         desc: "+25% clique por rank",    cost: 3, maxRank: 4,  requires: ["t4"],        x: 1, y: 2, effect: "click_pct",   effectPerRank: 0.25 },
+  { id: "t10", name: "Carga Explosiva",     desc: "+25% DPS por rank",       cost: 3, maxRank: 4,  requires: ["t5"],        x: 4, y: 2, effect: "dps_pct",     effectPerRank: 0.25 },
+  { id: "t11", name: "Colheita Sombria",    desc: "+25% RP por rank",        cost: 3, maxRank: 4,  requires: ["t6"],        x: 7, y: 2, effect: "rp_pct",      effectPerRank: 0.25 },
+  { id: "t12", name: "Multiplicador Crítico",desc: "+50% mult crit por rank",cost: 3, maxRank: 4,  requires: ["t7"],        x: 2, y: 2, effect: "crit_mult",   effectPerRank: 0.50 },
+  { id: "t13", name: "Caça ao Boss",        desc: "+30% dano a boss por rank",cost:3, maxRank: 4,  requires: ["t8"],        x: 5, y: 2, effect: "boss_dmg",    effectPerRank: 0.30 },
+  { id: "t14", name: "Vigília Offline",     desc: "+20% ganhos offline/rank",cost: 3, maxRank: 4,  requires: ["t6"],        x: 6, y: 2, effect: "offline_pct", effectPerRank: 0.20 },
+  // Row 3 - powerful
+  { id: "t15", name: "Transcendência I",    desc: "+50% tudo por rank",      cost: 5, maxRank: 3,  requires: ["t9","t10"],  x: 2, y: 3, effect: "all_pct",     effectPerRank: 0.50 },
+  { id: "t16", name: "Gene Lock Lv.∞",     desc: "+50% DPS por rank",       cost: 5, maxRank: 3,  requires: ["t10","t13"], x: 4, y: 3, effect: "dps_pct",     effectPerRank: 0.50 },
+  { id: "t17", name: "Fragmento Divino",    desc: "+50% clique por rank",    cost: 5, maxRank: 3,  requires: ["t9","t12"],  x: 1, y: 3, effect: "click_pct",   effectPerRank: 0.50 },
+  { id: "t18", name: "Além do Infinito",    desc: "+100% tudo por rank",     cost: 8, maxRank: 2,  requires: ["t15","t16"], x: 3, y: 4, effect: "all_pct",     effectPerRank: 1.00 },
+]
+
+// ────────────────────────────────────────────────────────────────────
+//  DAILY LOGIN REWARDS
+// ────────────────────────────────────────────────────────────────────
+
+export const DAILY_REWARDS: DailyLoginReward[] = [
+  { day: 1,  rp: 1000,   souls: 0, gene: 0,  rank: 0,  desc: "Dia 1 — Bem-vindo de volta!" },
+  { day: 2,  rp: 5000,   souls: 0, gene: 1,  rank: 0,  desc: "Dia 2 — Gene Fragment bônus" },
+  { day: 3,  rp: 10000,  souls: 1, gene: 0,  rank: 5,  desc: "Dia 3 — 1 Hero Soul!" },
+  { day: 4,  rp: 25000,  souls: 0, gene: 2,  rank: 10, desc: "Dia 4 — Gene duplo" },
+  { day: 5,  rp: 50000,  souls: 2, gene: 0,  rank: 20, desc: "Dia 5 — 2 Hero Souls!" },
+  { day: 6,  rp: 100000, souls: 0, gene: 5,  rank: 50, desc: "Dia 6 — Semana chegando..." },
+  { day: 7,  rp: 500000, souls: 5, gene: 5,  rank: 100,desc: "Dia 7 — RECOMPENSA SEMANAL!" },
+  { day: 14, rp: 2e6,    souls: 10,gene: 10, rank: 200,desc: "Dia 14 — 2 semanas dedicado!" },
+  { day: 21, rp: 10e6,   souls: 20,gene: 20, rank: 500,desc: "Dia 21 — 3 semanas no ciclo!" },
+  { day: 30, rp: 100e6,  souls: 50,gene: 50, rank: 1000,desc:"Dia 30 — 1 MÊS NO MAIN GOD SPACE!" },
+]
 
 export function formatNumber(num: number): string {
   if (!isFinite(num) || isNaN(num)) return "0"
@@ -655,6 +814,23 @@ export function spawnMonster(zone: number, worldIndex: number): GameState["monst
   }
 }
 
+// Spawn a farm monster — always a normal mob at fixed farmZone difficulty, never a boss
+export function spawnFarmMonster(farmZone: number, worldIndex: number): GameState["monster"] {
+  const world = WORLDS[Math.min(worldIndex, WORLDS.length - 1)]
+  // Always pick a zone that is NOT a boss zone (round down to nearest non-boss zone)
+  const safeZone = farmZone % 10 === 0 ? farmZone - 1 : farmZone
+  const baseHp = 10 * Math.pow(1.15, safeZone - 1) * Math.pow(2, world.tier - 1)
+  const mob    = world.mobs[Math.floor(Math.random() * world.mobs.length)]
+  const reward = Math.max(1, Math.floor(safeZone * Math.pow(1.1, safeZone / 10) * world.tier))
+  return {
+    hp:     baseHp,
+    maxHp:  baseHp,
+    reward,
+    name:   mob,
+    type:   "normal",
+  }
+}
+
 // Boss timer limit: 30s base + 5s per Chronos level
 export function getBossTimerLimit(ancientLevels: Record<string, number>): number {
   const chronosLv = ancientLevels["chron"] ?? 0
@@ -696,6 +872,9 @@ export function createInitialState(): GameState {
     autoProgressActive: false,
 
     activeChallengeId: null,
+    challengeActive: false,
+    challengeStartZone: 0,
+    challengeTargetZone: 0,
 
     progressionMode: "pushing",
     farmZone: 1,
@@ -726,6 +905,27 @@ export function createInitialState(): GameState {
     bloodlineOfflinePct:0,
     bloodlineCritChance:0,
     bloodlineCritMult:  0,
+
+    // Equipment
+    equippedItems: {},
+    equipmentOwned: new Set<string>(),
+
+    // Talent tree
+    talentPoints: 0,
+    talentRanks: {},
+
+    // Daily login
+    lastLoginDate: "",
+    loginStreak: 0,
+    loginRewardsClaimed: new Set<string>(),
+
+    // Black market
+    blackMarketRefreshes: 0,
+    blackMarketTradesLeft: {},
+    lastMarketRefresh: 0,
+
+    // Notifications
+    notifications: [],
 
     totalClicks: 0, totalKills: 0, bossKills: 0,
     cycles: 0, transcends: 0,

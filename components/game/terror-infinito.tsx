@@ -10,9 +10,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import {
   WORLDS, HEROES, UPGRADES, ACHIEVEMENTS, DIMENSIONS,
   ANCIENTS, SHOP_ITEMS, CHALLENGES, BLOODLINES, FORMATIONS,
-  HORROR_EVENTS, BLESSINGS,
-  formatNumber, formatTime, getHeroCost, spawnMonster, createInitialState, getBossTimerLimit,
-  type GameState, type Hero, type HorrorEvent, type Blessing,
+  HORROR_EVENTS, BLESSINGS, BLACK_MARKET, EQUIPMENT, TALENT_TREE, DAILY_REWARDS,
+  formatNumber, formatTime, getHeroCost, spawnMonster, spawnFarmMonster, createInitialState, getBossTimerLimit,
+  type GameState, type Hero, type HorrorEvent, type Blessing, type Equipment as EquipmentType,
 } from "@/lib/game-data"
 import {
   Skull, Swords, Flame, Shield, Zap, Star, Trophy, Settings,
@@ -30,13 +30,14 @@ const SAVE_KEY = "terrorInfinitoSave_v5"
 function serialize(s: GameState): string {
   return JSON.stringify({
     ...s,
-    upgradeBought:    Array.from(s.upgradeBought),
-    shopBought:       Array.from(s.shopBought),
-    achievementsDone: Array.from(s.achievementsDone),
-    bloodlinesOwned:  Array.from(s.bloodlinesOwned),
-    challengesDone:   Array.from(s.challengesDone),
-    blessingsActive:  Array.from(s.blessingsActive),
-    // don't persist active event — reset on load
+    upgradeBought:       Array.from(s.upgradeBought),
+    shopBought:          Array.from(s.shopBought),
+    achievementsDone:    Array.from(s.achievementsDone),
+    bloodlinesOwned:     Array.from(s.bloodlinesOwned),
+    challengesDone:      Array.from(s.challengesDone),
+    blessingsActive:     Array.from(s.blessingsActive),
+    equipmentOwned:      Array.from(s.equipmentOwned),
+    loginRewardsClaimed: Array.from(s.loginRewardsClaimed),
     activeEvent: null,
   })
 }
@@ -47,16 +48,19 @@ function deserialize(json: string): GameState {
   return {
     ...base,
     ...p,
-    upgradeBought:    new Set<string>(p.upgradeBought    ?? []),
-    shopBought:       new Set<string>(p.shopBought       ?? []),
-    achievementsDone: new Set<string>(p.achievementsDone ?? []),
-    bloodlinesOwned:  new Set<string>(p.bloodlinesOwned  ?? []),
-    challengesDone:   new Set<string>(p.challengesDone   ?? []),
-    blessingsActive:  new Set<string>(p.blessingsActive  ?? []),
+    upgradeBought:       new Set<string>(p.upgradeBought       ?? []),
+    shopBought:          new Set<string>(p.shopBought          ?? []),
+    achievementsDone:    new Set<string>(p.achievementsDone    ?? []),
+    bloodlinesOwned:     new Set<string>(p.bloodlinesOwned     ?? []),
+    challengesDone:      new Set<string>(p.challengesDone      ?? []),
+    blessingsActive:     new Set<string>(p.blessingsActive     ?? []),
+    equipmentOwned:      new Set<string>(p.equipmentOwned      ?? []),
+    loginRewardsClaimed: new Set<string>(p.loginRewardsClaimed ?? []),
     monster: p.monster ?? spawnMonster(1, 0),
     activeEvent: null,
     eventEndsAt: 0,
     eventMult: 1,
+    notifications: p.notifications ?? [],
   }
 }
 
@@ -71,12 +75,17 @@ function calcDPS(s: GameState): number {
     const lv = s.heroLevels[h.id] ?? 0
     if (lv > 0 && h.baseDps > 0) {
       let hDps = h.baseDps * lv
-      // per-hero upgrades
       UPGRADES.forEach(u => {
         if (s.upgradeBought.has(u.id) && u.heroId === h.id && u.type === "dps")
           hDps *= u.mult
       })
       hDps *= s.heroDpsMults[h.id] ?? 1
+      // Equipment bonus for this hero
+      const eqId = s.equippedItems[h.id]
+      if (eqId) {
+        const eq = EQUIPMENT.find(e => e.id === eqId)
+        if (eq) hDps *= eq.dpsMult
+      }
       dps += hDps
     }
   })
@@ -86,6 +95,13 @@ function calcDPS(s: GameState): number {
     if (s.upgradeBought.has(u.id) && u.type === "global")
       dps *= u.mult
   })
+
+  // global equipment
+  const globalEqId = s.equippedItems["global"]
+  if (globalEqId) {
+    const eq = EQUIPMENT.find(e => e.id === globalEqId)
+    if (eq) dps *= eq.dpsMult
+  }
 
   // dimensions
   DIMENSIONS.forEach(d => {
@@ -97,33 +113,39 @@ function calcDPS(s: GameState): number {
   const siyaLv  = s.ancientLevels["siya"]  ?? 0
   const morgLv  = s.ancientLevels["morg"]  ?? 0
   const gazeLv  = s.ancientLevels["gaze"]  ?? 0
-  const terrLv  = s.ancientLevels["terror"]?? 0
   if (siyaLv > 0) dps *= 1 + siyaLv * 0.25
   if (morgLv > 0) dps *= 1 + morgLv * 0.11
   if (gazeLv > 0) dps *= 1 + gazeLv * 0.01
 
-  // notoriety bonus
-  dps *= s.notorietyMult
+  // talent bonuses
+  const talentDpsPct = calcTalentBonus(s, "dps_pct") + calcTalentBonus(s, "all_pct")
+  if (talentDpsPct > 0) dps *= 1 + talentDpsPct
 
-  // event mult
-  dps *= s.eventMult
+  // notoriety, event, transcend
+  dps *= s.notorietyMult * s.eventMult * s.transcendMult
 
-  // transcend
-  dps *= s.transcendMult
-
-  // shop flat
+  // shop flat + bloodline
   dps += s.shopDps
-
-  // bloodline
   dps *= 1 + s.bloodlineDpsPct
 
-  // formation bonuses
+  // formations
   FORMATIONS.forEach(f => {
     const allOwned = f.heroes.every(hid => (s.heroLevels[hid] ?? 0) > 0)
     if (allOwned) dps *= 1 + f.dpsBonus
   })
 
   return dps
+}
+
+function calcTalentBonus(s: GameState, effect: string): number {
+  let total = 0
+  TALENT_TREE.forEach(node => {
+    if (node.effect === effect) {
+      const rank = s.talentRanks[node.id] ?? 0
+      if (rank > 0) total += node.effectPerRank * rank
+    }
+  })
+  return total
 }
 
 function calcPPC(s: GameState): number {
@@ -147,6 +169,16 @@ function calcPPC(s: GameState): number {
   const fragLv = s.ancientLevels["frag"] ?? 0
   if (argLv  > 0) ppc *= 1 + argLv  * 0.20
   if (fragLv > 0) ppc *= 1 + fragLv * 0.30
+
+  // equipment
+  const eqId0 = s.equippedItems["h0"]
+  if (eqId0) { const eq = EQUIPMENT.find(e => e.id === eqId0); if (eq) ppc *= eq.clickMult }
+  const globalEqId = s.equippedItems["global"]
+  if (globalEqId) { const eq = EQUIPMENT.find(e => e.id === globalEqId); if (eq) ppc *= eq.clickMult }
+
+  // talent
+  const talentClickPct = calcTalentBonus(s, "click_pct") + calcTalentBonus(s, "all_pct")
+  if (talentClickPct > 0) ppc *= 1 + talentClickPct
 
   ppc += s.shopPpc
   ppc *= 1 + s.bloodlineClickPct
@@ -181,6 +213,21 @@ function applyKill(prev: GameState): GameState {
     ? Math.max(prev.farmZone, newZone - 1)
     : prev.farmZone
 
+  // Equipment drop from bosses
+  let newEquipOwned = prev.equipmentOwned
+  if (isBoss) {
+    const eligible = EQUIPMENT.filter(e => e.dropZone <= prev.zone && !prev.equipmentOwned.has(e.id))
+    if (eligible.length > 0) {
+      const rarityChance = { common: 0.4, rare: 0.2, epic: 0.08, legendary: 0.02 }
+      eligible.forEach(e => {
+        if (Math.random() < rarityChance[e.rarity]) {
+          newEquipOwned = new Set(newEquipOwned)
+          newEquipOwned.add(e.id)
+        }
+      })
+    }
+  }
+
   return {
     ...prev,
     rp:         prev.rp + finalRp,
@@ -196,7 +243,7 @@ function applyKill(prev: GameState): GameState {
     monster:    spawnMonster(newZone, newWorld),
     bestiary,
     farmZone:   newFarmZone,
-    // Reset boss state after kill
+    equipmentOwned: newEquipOwned,
     bossActive:      false,
     bossTimerStart:  0,
     bossFailCount:   isBoss ? 0 : prev.bossFailCount,
@@ -212,10 +259,12 @@ export function TerrorInfinitoGame() {
   const [dmgNums, setDmgNums]   = useState<Array<{ id:number; val:number; x:number; y:number; crit:boolean }>>([])
   const [floats, setFloats]     = useState<Array<{ id:number; text:string; type:string }>>([])
   const [activeTab, setActiveTab] = useState("heroes")
-  const [modal, setModal]       = useState<null | "prestige" | "transcend" | "challenge" | "settings" | "bloodline" | "bestiary">(null)
+  const [modal, setModal]       = useState<null | "prestige" | "transcend" | "challenge" | "settings" | "bloodline" | "bestiary" | "equipment" | "talents" | "daily" | "market">(null)
   const [buyAmount, setBuyAmount] = useState<1 | 10 | 100>(1)
   const [dpsHistory, setDpsHistory] = useState<number[]>([])
   const [isLoaded, setIsLoaded] = useState(false)
+  const [showDailyReward, setShowDailyReward] = useState(false)
+  const [dailyRewardInfo, setDailyRewardInfo] = useState<{rp:number;souls:number;gene:number;rank:number;desc:string;streak:number}|null>(null)
 
   const dmgId  = useRef(0)
   const floatId = useRef(0)
@@ -231,7 +280,7 @@ export function TerrorInfinitoGame() {
         const now = Date.now()
         const offlineSec = Math.max(0, Math.floor((now - loaded.startTime - loaded.playTime * 1000) / 1000))
         if (offlineSec > 30) {
-          const offlineMult = 0.10 + loaded.bloodlineOfflinePct
+          const offlineMult = 0.10 + loaded.bloodlineOfflinePct + loaded.blessingOfflineMult
           const offlineRp = Math.floor(loaded.dps * offlineSec * offlineMult)
           if (offlineRp > 0) {
             loaded.rp += offlineRp
@@ -240,7 +289,26 @@ export function TerrorInfinitoGame() {
             toast(`Ganhou ${formatNumber(offlineRp)} RP offline (${formatTime(offlineSec)})`, "gold")
           }
         }
+        // Daily login check
+        const today = new Date().toISOString().split("T")[0]
+        if (loaded.lastLoginDate !== today) {
+          const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0]
+          const newStreak = loaded.lastLoginDate === yesterday ? loaded.loginStreak + 1 : 1
+          const rewardDay = DAILY_REWARDS.find(r => r.day === newStreak) ?? DAILY_REWARDS[0]
+          loaded.rp += rewardDay.rp
+          loaded.souls += rewardDay.souls
+          loaded.gene += rewardDay.gene
+          loaded.rank += rewardDay.rank
+          loaded.lastLoginDate = today
+          loaded.loginStreak = newStreak
+          setDailyRewardInfo({ ...rewardDay, streak: newStreak })
+          setShowDailyReward(true)
+        }
         setGs(loaded)
+      } else {
+        // First time playing — give a small welcome reward
+        const today = new Date().toISOString().split("T")[0]
+        setGs(prev => ({ ...prev, lastLoginDate: today, loginStreak: 1 }))
       }
     } catch { /* silent */ }
     setIsLoaded(true)
@@ -279,34 +347,67 @@ export function TerrorInfinitoGame() {
         let s = { ...prev, dps, ppc, playTime: prev.playTime + 0.1 }
 
         const isBossZone = s.monster.type === "boss" || s.monster.type === "megaboss"
+        const isFarming  = s.progressionMode === "farming"
 
-        // ── Boss timer: start when we enter a boss zone in push mode
-        if (isBossZone && s.progressionMode === "pushing" && !s.bossActive) {
+        // ── While FARMING: spawn farm mobs in a loop (never bosses, fixed difficulty)
+        if (isFarming) {
+          const dmg = (dps + (s.autoClickerActive ? ppc : 0)) * 0.1
+          if (dmg > 0) {
+            if (s.monster.hp - dmg <= 0) {
+              // Kill farm mob → gain RP, spawn another farm mob immediately (same zone)
+              const reward = s.monster.reward
+              const mamLv  = s.ancientLevels["mamm"] ?? 0
+              const doraLv = s.ancientLevels["dora"] ?? 0
+              const rpMult = (1 + mamLv * 0.10) * (1 + doraLv * 0.35) * (1 + s.bloodlineRpPct)
+              const finalRp = Math.floor(reward * rpMult)
+              const farmWorldIdx = Math.min(Math.floor((s.farmZone - 1) / 100), WORLDS.length - 1)
+              const monKey = `${s.worldIndex}_${s.monster.name}`
+              s = {
+                ...s,
+                rp:         s.rp + finalRp,
+                rpTotal:    s.rpTotal + finalRp,
+                rpAllTime:  s.rpAllTime + finalRp,
+                rank:       s.rank + Math.max(1, Math.ceil(finalRp * 0.005)),
+                totalKills: s.totalKills + 1,
+                bestiary:   { ...s.bestiary, [monKey]: (s.bestiary[monKey] ?? 0) + 1 },
+                // Spawn next farm mob — same fixed difficulty, never a boss
+                monster: spawnFarmMonster(s.farmZone, farmWorldIdx),
+              }
+            } else {
+              s = { ...s, monster: { ...s.monster, hp: s.monster.hp - dmg } }
+            }
+          }
+          return s
+        }
+
+        // ── While PUSHING ──────────────────────────────────────────────
+
+        // Start boss timer when we hit a boss zone
+        if (isBossZone && !s.bossActive) {
           const limit = getBossTimerLimit(s.ancientLevels)
           s = { ...s, bossActive: true, bossTimerStart: now, bossTimerLimit: limit }
         }
 
-        // ── Boss timer expiry → fall back to farm zone
+        // Boss timer expired → fall back to farm automatically
         if (s.bossActive && isBossZone) {
           const elapsed = (now - s.bossTimerStart) / 1000
           if (elapsed >= s.bossTimerLimit) {
-            const fallbackZone = Math.max(1, s.farmZone)
-            const fallbackWorld = Math.min(Math.floor((fallbackZone - 1) / 100), WORLDS.length - 1)
+            const farmWorldIdx = Math.min(Math.floor((s.farmZone - 1) / 100), WORLDS.length - 1)
             s = {
               ...s,
-              zone:           fallbackZone,
-              worldIndex:     fallbackWorld,
-              monster:        spawnMonster(fallbackZone, fallbackWorld),
               progressionMode: "farming",
-              bossActive:     false,
-              bossTimerStart: 0,
-              bossFailCount:  s.bossFailCount + 1,
+              zone:            s.farmZone,
+              worldIndex:      farmWorldIdx,
+              monster:         spawnFarmMonster(s.farmZone, farmWorldIdx),
+              bossActive:      false,
+              bossTimerStart:  0,
+              bossFailCount:   s.bossFailCount + 1,
             }
             return s
           }
         }
 
-        // ── DPS damage
+        // DPS damage in push mode
         if (dps > 0) {
           const dmg = dps * 0.1
           if (s.monster.hp - dmg <= 0) {
@@ -316,7 +417,7 @@ export function TerrorInfinitoGame() {
           }
         }
 
-        // ── Auto-clicker
+        // Auto-clicker in push mode
         const autoRate = s.autoClickerFast ? 5 : s.autoClickerActive ? 1 : 0
         if (autoRate > 0) {
           const autoDmg = ppc * autoRate * 0.1
@@ -327,41 +428,30 @@ export function TerrorInfinitoGame() {
           }
         }
 
-        // ── Combo decay (if no click for 2s)
+        // Combo decay
         if (now - s.lastClickTime > 2000 && s.combo > s.blessingComboFloor) {
           s = { ...s, combo: Math.max(s.blessingComboFloor, s.combo - 1) }
         }
 
-        // ── Horror event expiry
+        // Horror event expiry
         if (s.activeEvent && now > s.eventEndsAt) {
           s = { ...s, activeEvent: null, eventMult: 1, eventEndsAt: 0 }
         }
 
-        // ── Random horror event trigger (avg every 10 min)
+        // Random horror event trigger
         if (!s.activeEvent && Math.random() < 0.0001) {
           const ev = HORROR_EVENTS[Math.floor(Math.random() * HORROR_EVENTS.length)]
-          const mult = ev.effect === "dps_mult" ? ev.effectValue
-                     : ev.effect === "click_mult" ? ev.effectValue
-                     : ev.effect === "gold_mult" ? ev.effectValue : 1
           s = {
             ...s,
             activeEvent: ev,
             eventEndsAt: now + ev.duration * 1000,
-            eventMult: ev.effect === "dps_mult" ? mult : s.eventMult,
-          }
-        }
-
-        // ── Auto-progress (shop item): skip non-boss zones automatically
-        if (s.autoProgressActive && s.monster.type === "normal" && s.progressionMode === "pushing") {
-          if (s.dps > 0 && s.monster.hp / (s.dps * 0.1) < 3) {
-            // monster will die in < 3 ticks anyway, let DPS handle it
+            eventMult: ev.effect === "dps_mult" ? ev.effectValue : s.eventMult,
           }
         }
 
         return s
       })
 
-      // DPS history for graph
       setGs(s => {
         setDpsHistory(h => [...h.slice(-59), s.dps])
         return s
@@ -573,6 +663,8 @@ export function TerrorInfinitoGame() {
       toast(`CICLO! +${soulsGain} Almas`, "prestige")
       if (geneGain > 0) toast(`+${geneGain} Genes`, "gene")
       if (rankGain > 0) toast(`+${rankGain} Rank`,  "rank")
+      const talentGain = 1 + Math.floor(prev.highZone / 100)
+      toast(`+${talentGain} Pontos de Talento`, "upgrade")
       const init = createInitialState()
       return {
         ...init,
@@ -605,6 +697,18 @@ export function TerrorInfinitoGame() {
         bloodlineCritMult:   prev.bloodlineCritMult,
         maxCombo:            prev.maxCombo,
         bestiary:            prev.bestiary,
+        // Equipment & Talents persist
+        equipmentOwned:    prev.equipmentOwned,
+        equippedItems:     prev.equippedItems,
+        talentPoints:      prev.talentPoints + talentGain,
+        talentRanks:       prev.talentRanks,
+        // Daily login persists
+        lastLoginDate:     prev.lastLoginDate,
+        loginStreak:       prev.loginStreak,
+        loginRewardsClaimed: prev.loginRewardsClaimed,
+        // Market persists
+        blackMarketRefreshes: prev.blackMarketRefreshes,
+        blackMarketTradesLeft: prev.blackMarketTradesLeft,
         // Reset progression
         progressionMode: "pushing",
         farmZone: 1,
@@ -650,7 +754,7 @@ export function TerrorInfinitoGame() {
   const toggleProgressionMode = useCallback(() => {
     setGs(prev => {
       if (prev.progressionMode === "farming") {
-        // Go back to pushing: move to farmZone+1 (the boss that failed)
+        // Go back to pushing: move to the boss zone ahead of farmZone
         const pushZone  = prev.farmZone + 1
         const pushWorld = Math.min(Math.floor((pushZone - 1) / 100), WORLDS.length - 1)
         const limit     = getBossTimerLimit(prev.ancientLevels)
@@ -665,20 +769,88 @@ export function TerrorInfinitoGame() {
           bossTimerLimit:  limit,
         }
       } else {
-        // Switch to farming: go back to farmZone
-        const farmWorld = Math.min(Math.floor((prev.farmZone - 1) / 100), WORLDS.length - 1)
+        // Manually retreat to farm
+        const farmWorldIdx = Math.min(Math.floor((prev.farmZone - 1) / 100), WORLDS.length - 1)
         return {
           ...prev,
           progressionMode: "farming",
-          zone:            Math.max(1, prev.farmZone),
-          worldIndex:      farmWorld,
-          monster:         spawnMonster(Math.max(1, prev.farmZone), farmWorld),
+          zone:            prev.farmZone,
+          worldIndex:      farmWorldIdx,
+          monster:         spawnFarmMonster(prev.farmZone, farmWorldIdx),
           bossActive:      false,
           bossTimerStart:  0,
         }
       }
     })
   }, [])
+
+  // ── Equip item
+  const equipItem = useCallback((equipId: string, heroId: string) => {
+    setGs(prev => {
+      if (!prev.equipmentOwned.has(equipId)) return prev
+      toast(`Equipado: ${EQUIPMENT.find(e => e.id === equipId)?.name}`, "shop")
+      return { ...prev, equippedItems: { ...prev.equippedItems, [heroId]: equipId } }
+    })
+  }, [toast])
+
+  // ── Buy talent node
+  const buyTalent = useCallback((nodeId: string) => {
+    setGs(prev => {
+      const node = TALENT_TREE.find(n => n.id === nodeId)
+      if (!node) return prev
+      const rank = prev.talentRanks[nodeId] ?? 0
+      if (rank >= node.maxRank) return prev
+      const reqsMet = node.requires.every(r => (prev.talentRanks[r] ?? 0) > 0)
+      if (!reqsMet) return prev
+      if (prev.talentPoints < node.cost) return prev
+      toast(`Talento: ${node.name} Nv.${rank + 1}`, "upgrade")
+      return {
+        ...prev,
+        talentPoints: prev.talentPoints - node.cost,
+        talentRanks: { ...prev.talentRanks, [nodeId]: rank + 1 },
+      }
+    })
+  }, [toast])
+
+  // ── Black market trade
+  const doMarketTrade = useCallback((offerId: string) => {
+    setGs(prev => {
+      const offer = BLACK_MARKET.find(o => o.id === offerId)
+      if (!offer) return prev
+      const left = prev.blackMarketTradesLeft[offerId] ?? offer.maxTrades
+      if (left <= 0) return prev
+      const have = prev[offer.fromCurrency as keyof GameState] as number
+      if (have < offer.fromAmount) return prev
+      const updates: Partial<GameState> = {
+        blackMarketTradesLeft: { ...prev.blackMarketTradesLeft, [offerId]: left - 1 },
+      }
+      // deduct from
+      ;(updates as Record<string, unknown>)[offer.fromCurrency] = have - offer.fromAmount
+      // add to
+      const haveTo = prev[offer.toCurrency as keyof GameState] as number
+      ;(updates as Record<string, unknown>)[offer.toCurrency] = haveTo + offer.toAmount
+      toast(`Troca: +${formatNumber(offer.toAmount)} ${offer.toCurrency.toUpperCase()}`, "shop")
+      return { ...prev, ...updates } as GameState
+    })
+  }, [toast])
+
+  // ── Refresh black market (costs rank)
+  const refreshMarket = useCallback(() => {
+    setGs(prev => {
+      const cost = 100 * (prev.blackMarketRefreshes + 1)
+      if (prev.rank < cost) return prev
+      const newLeft: Record<string, number> = {}
+      BLACK_MARKET.forEach(o => { newLeft[o.id] = o.maxTrades })
+      toast("Mercado Negro atualizado!", "shop")
+      return {
+        ...prev,
+        rank: prev.rank - cost,
+        blackMarketRefreshes: prev.blackMarketRefreshes + 1,
+        blackMarketTradesLeft: newLeft,
+        lastMarketRefresh: Date.now(),
+      }
+    })
+  }, [toast])
 
   const resetGame = useCallback(() => {
     if (confirm("Resetar TODO o progresso? Isso nao pode ser desfeito!")) {
@@ -807,25 +979,25 @@ export function TerrorInfinitoGame() {
                       className={`text-xs h-7 px-2 ${gs.progressionMode === "pushing" ? "bg-red-600 hover:bg-red-700 border-red-500" : "border-green-600 text-green-400 hover:bg-green-900/30"}`}
                       onClick={toggleProgressionMode}
                     >
-                      {gs.progressionMode === "pushing" ? "⚔ AVANÇANDO" : "🌾 FARMANDO"}
+                      {gs.progressionMode === "pushing" ? "⚔ AVANÇANDO" : "🌾 FARM — Tentar Boss?"}
                     </Button>
                     <span className="font-mono font-bold text-sm">Z{gs.zone}</span>
                   </div>
                 </div>
 
                 {/* Progression status bar */}
-                <div className="mt-2 flex items-center gap-2 text-xs">
-                  <span className={gs.progressionMode === "pushing" ? "text-red-400" : "text-green-400"}>
-                    {gs.progressionMode === "pushing"
-                      ? `Tentando avançar → Zona ${gs.zone}`
-                      : `Farmando → Zona ${gs.farmZone}`
-                    }
-                  </span>
-                  <span className="text-muted-foreground/60">
-                    | Farm segura: Z{gs.farmZone} | Recorde: Z{gs.highZone}
-                  </span>
-                  {gs.bossFailCount > 0 && (
-                    <span className="text-orange-400">| Falhas no boss: {gs.bossFailCount}x</span>
+                <div className="mt-2 flex items-center gap-2 text-xs flex-wrap">
+                  {gs.progressionMode === "farming" ? (
+                    <>
+                      <span className="text-green-400">🌾 Farmando monstros normais — dificuldade fixa (Z{gs.farmZone})</span>
+                      <span className="text-muted-foreground/60">| Clique no botão para tentar o boss novamente</span>
+                      {gs.bossFailCount > 0 && <span className="text-orange-400">| Boss falhou {gs.bossFailCount}x</span>}
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-red-400">⚔ Avançando → Z{gs.zone}</span>
+                      <span className="text-muted-foreground/60">| Recorde: Z{gs.highZone} | Farm: Z{gs.farmZone}</span>
+                    </>
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">Mundo {gs.worldIndex + 1}/{WORLDS.length}: {world.name}</p>
@@ -955,7 +1127,7 @@ export function TerrorInfinitoGame() {
                 <DpsGraph history={dpsHistory} />
               </div>
 
-              {/* Prestige / Transcend buttons */}
+              {/* Prestige / Transcend / Challenge / new buttons */}
               <div className="grid grid-cols-3 gap-2">
                 <Button
                   variant="outline"
@@ -996,6 +1168,46 @@ export function TerrorInfinitoGame() {
                     <span className="text-sm font-semibold">Desafio</span>
                   </div>
                   <span className="text-xs text-muted-foreground">{gs.challengesDone.size}/{CHALLENGES.length}</span>
+                </Button>
+              </div>
+
+              {/* New system buttons */}
+              <div className="grid grid-cols-4 gap-2">
+                <Button
+                  variant="outline" size="sm"
+                  className="h-auto py-2 flex-col gap-0.5 border-yellow-500/30 hover:bg-yellow-500/10"
+                  onClick={() => setModal("equipment")}
+                >
+                  <Swords className="w-4 h-4 text-yellow-400" />
+                  <span className="text-xs text-yellow-400">Equip</span>
+                  <span className="text-xs text-muted-foreground">{gs.equipmentOwned.size}</span>
+                </Button>
+                <Button
+                  variant="outline" size="sm"
+                  className="h-auto py-2 flex-col gap-0.5 border-cyan-500/30 hover:bg-cyan-500/10"
+                  onClick={() => setModal("talents")}
+                >
+                  <Star className="w-4 h-4 text-cyan-400" />
+                  <span className="text-xs text-cyan-400">Talentos</span>
+                  <span className="text-xs text-muted-foreground">{gs.talentPoints}pts</span>
+                </Button>
+                <Button
+                  variant="outline" size="sm"
+                  className="h-auto py-2 flex-col gap-0.5 border-orange-500/30 hover:bg-orange-500/10"
+                  onClick={() => setModal("market")}
+                >
+                  <ShoppingBag className="w-4 h-4 text-orange-400" />
+                  <span className="text-xs text-orange-400">Mercado</span>
+                  <span className="text-xs text-muted-foreground">Negro</span>
+                </Button>
+                <Button
+                  variant="outline" size="sm"
+                  className="h-auto py-2 flex-col gap-0.5 border-green-500/30 hover:bg-green-500/10"
+                  onClick={() => setModal("daily")}
+                >
+                  <Trophy className="w-4 h-4 text-green-400" />
+                  <span className="text-xs text-green-400">Daily</span>
+                  <span className="text-xs text-muted-foreground">Dia {gs.loginStreak}</span>
                 </Button>
               </div>
 
@@ -1408,8 +1620,202 @@ export function TerrorInfinitoGame() {
           </Modal>
         )}
 
-        {/* Settings */}
-        {modal === "settings" && (
+        {/* Equipment Modal */}
+        {modal === "equipment" && (
+          <Modal title="Equipamentos" icon={<Swords className="w-5 h-5 text-yellow-400" />} onClose={() => setModal(null)}>
+            <p className="text-xs text-muted-foreground mb-3">Itens dropam de bosses. Equipe em heróis para bônus permanentes neste ciclo.</p>
+            {gs.equipmentOwned.size === 0 && (
+              <p className="text-sm text-muted-foreground text-center py-6">Nenhum equipamento ainda. Mate bosses para dropar itens!</p>
+            )}
+            <div className="space-y-2">
+              {EQUIPMENT.filter(e => gs.equipmentOwned.has(e.id)).map(eq => {
+                const rarityColor = eq.rarity === "legendary" ? "text-yellow-400 border-yellow-500/40" : eq.rarity === "epic" ? "text-purple-400 border-purple-500/40" : eq.rarity === "rare" ? "text-blue-400 border-blue-500/40" : "text-gray-400 border-gray-500/40"
+                const equipped = Object.entries(gs.equippedItems).find(([, v]) => v === eq.id)
+                return (
+                  <div key={eq.id} className={`p-3 rounded-lg border ${rarityColor} bg-muted/20`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-sm">{eq.name}</span>
+                          <Badge className={`text-xs ${rarityColor}`}>{eq.rarity}</Badge>
+                          {equipped && <Badge className="text-xs bg-green-500/20 text-green-400">Equipado</Badge>}
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">{eq.desc}</p>
+                        <div className="flex gap-3 mt-1 text-xs">
+                          {eq.dpsMult > 1 && <span className="text-blue-400">DPS x{eq.dpsMult}</span>}
+                          {eq.clickMult > 1 && <span className="text-green-400">Click x{eq.clickMult}</span>}
+                          {eq.rpMult > 1 && <span className="text-amber-400">RP x{eq.rpMult}</span>}
+                        </div>
+                      </div>
+                      <Button size="sm" variant="outline" className="text-xs h-7"
+                        onClick={() => equipItem(eq.id, eq.heroId)}>
+                        Equipar
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <div className="mt-4 pt-3 border-t border-border">
+              <p className="text-xs text-muted-foreground">Itens por desbloquear: {EQUIPMENT.filter(e => !gs.equipmentOwned.has(e.id)).length} | Requer zona mínima para dropar.</p>
+            </div>
+          </Modal>
+        )}
+
+        {/* Talents Modal */}
+        {modal === "talents" && (
+          <Modal title="Árvore de Talentos" icon={<Star className="w-5 h-5 text-cyan-400" />} onClose={() => setModal(null)}>
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-xs text-muted-foreground">Talentos são permanentes. +1pt por ciclo +1pt a cada 100 zonas.</p>
+              <Badge className="bg-cyan-500/20 text-cyan-400">{gs.talentPoints} pts</Badge>
+            </div>
+            <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+              {TALENT_TREE.map(node => {
+                const rank = gs.talentRanks[node.id] ?? 0
+                const maxed = rank >= node.maxRank
+                const reqsMet = node.requires.every(r => (gs.talentRanks[r] ?? 0) > 0)
+                const can = !maxed && reqsMet && gs.talentPoints >= node.cost
+                const totalBonus = (node.effectPerRank * rank * 100).toFixed(0)
+                return (
+                  <div key={node.id}
+                    className={`p-2.5 rounded-lg border transition-colors ${
+                      maxed ? "border-cyan-500/40 bg-cyan-500/10" :
+                      can   ? "border-cyan-500/30 hover:bg-cyan-500/5 cursor-pointer" :
+                      !reqsMet ? "border-border opacity-30" :
+                              "border-border opacity-50 cursor-not-allowed"
+                    }`}
+                    onClick={() => can && buyTalent(node.id)}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-sm font-medium">{node.name}</span>
+                          <Badge variant="secondary" className="text-xs">{rank}/{node.maxRank}</Badge>
+                          {maxed && <Badge className="text-xs bg-cyan-500/20 text-cyan-400">MAX</Badge>}
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">{node.desc}</p>
+                        {rank > 0 && <p className="text-xs text-cyan-400 mt-0.5">Bônus atual: +{totalBonus}%</p>}
+                        {!reqsMet && <p className="text-xs text-red-400 mt-0.5">Requer: {node.requires.join(", ")}</p>}
+                      </div>
+                      {!maxed && (
+                        <div className="text-right shrink-0">
+                          <p className={`text-sm font-mono ${can ? "text-cyan-400" : "text-muted-foreground"}`}>{node.cost}pt</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </Modal>
+        )}
+
+        {/* Black Market Modal */}
+        {modal === "market" && (
+          <Modal title="Mercado Negro" icon={<ShoppingBag className="w-5 h-5 text-orange-400" />} onClose={() => setModal(null)}>
+            <p className="text-xs text-muted-foreground mb-1">Troque moedas a taxas desfavoráveis mas úteis em emergências.</p>
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-xs text-muted-foreground">Refreshes: {gs.blackMarketRefreshes}</span>
+              <Button size="sm" variant="outline" className="h-7 text-xs border-orange-500/30 text-orange-400"
+                onClick={refreshMarket}
+                disabled={gs.rank < 100 * (gs.blackMarketRefreshes + 1)}>
+                Refresh ({formatNumber(100 * (gs.blackMarketRefreshes + 1))} Rank)
+              </Button>
+            </div>
+            <div className="space-y-2">
+              {BLACK_MARKET.map(offer => {
+                const left = gs.blackMarketTradesLeft[offer.id] ?? offer.maxTrades
+                const fromVal = gs[offer.fromCurrency as keyof GameState] as number
+                const can = left > 0 && fromVal >= offer.fromAmount
+                const currLabel = (c: string) => c === "rp" ? "RP" : c === "rank" ? "Rank" : c === "gene" ? "Gene" : c === "souls" ? "Almas" : "Void"
+                const currColor = (c: string) => c === "rp" ? "text-amber-400" : c === "rank" ? "text-orange-400" : c === "gene" ? "text-emerald-400" : c === "souls" ? "text-purple-400" : "text-fuchsia-400"
+                return (
+                  <div key={offer.id}
+                    className={`p-2.5 rounded-lg border transition-colors ${
+                      can ? "border-orange-500/30 hover:bg-orange-500/5 cursor-pointer" : "border-border opacity-40 cursor-not-allowed"
+                    }`}
+                    onClick={() => can && doMarketTrade(offer.id)}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex-1">
+                        <span className="text-sm font-medium">{offer.name}</span>
+                        <div className="flex items-center gap-2 mt-0.5 text-xs">
+                          <span className={currColor(offer.fromCurrency)}>-{formatNumber(offer.fromAmount)} {currLabel(offer.fromCurrency)}</span>
+                          <span className="text-muted-foreground">→</span>
+                          <span className={currColor(offer.toCurrency)}>+{formatNumber(offer.toAmount)} {currLabel(offer.toCurrency)}</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">{offer.desc}</p>
+                      </div>
+                      <Badge className={left > 0 ? "bg-orange-500/20 text-orange-400" : "opacity-40"}>{left}/{offer.maxTrades}</Badge>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </Modal>
+        )}
+
+        {/* Daily Login Modal */}
+        {modal === "daily" && (
+          <Modal title="Login Diário" icon={<Trophy className="w-5 h-5 text-green-400" />} onClose={() => setModal(null)}>
+            <div className="text-center mb-4">
+              <p className="text-2xl font-bold text-green-400">Dia {gs.loginStreak} 🔥</p>
+              <p className="text-xs text-muted-foreground">Último login: {gs.lastLoginDate || "Hoje"}</p>
+            </div>
+            <div className="space-y-2">
+              {DAILY_REWARDS.map(r => {
+                const claimed = gs.loginStreak >= r.day
+                const isCurrent = gs.loginStreak === r.day
+                return (
+                  <div key={r.day} className={`p-2.5 rounded-lg border flex items-center gap-3 ${
+                    isCurrent ? "border-green-500/50 bg-green-500/10" :
+                    claimed   ? "border-border bg-muted/10 opacity-50" :
+                                "border-border opacity-30"
+                  }`}>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shrink-0 ${
+                      isCurrent ? "bg-green-500/30 text-green-400" :
+                      claimed   ? "bg-muted text-muted-foreground" :
+                                  "bg-muted/20 text-muted-foreground"
+                    }`}>{r.day}</div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium truncate">{r.desc}</p>
+                      <div className="flex gap-2 text-xs mt-0.5 flex-wrap">
+                        {r.rp > 0    && <span className="text-amber-400">+{formatNumber(r.rp)} RP</span>}
+                        {r.souls > 0 && <span className="text-purple-400">+{r.souls} Almas</span>}
+                        {r.gene > 0  && <span className="text-emerald-400">+{r.gene} Gene</span>}
+                        {r.rank > 0  && <span className="text-orange-400">+{r.rank} Rank</span>}
+                      </div>
+                    </div>
+                    {claimed && !isCurrent && <span className="text-green-400 text-xs shrink-0">✓</span>}
+                    {isCurrent && <Badge className="bg-green-500/20 text-green-400 shrink-0 text-xs">HOJE</Badge>}
+                  </div>
+                )
+              })}
+            </div>
+          </Modal>
+        )}
+
+        {/* Daily Reward Popup */}
+        {showDailyReward && dailyRewardInfo && (
+          <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowDailyReward(false)}>
+            <div className="bg-card border border-green-500/50 rounded-xl p-6 max-w-sm w-full text-center shadow-[0_0_40px_rgba(34,197,94,0.2)]" onClick={e => e.stopPropagation()}>
+              <Trophy className="w-12 h-12 text-green-400 mx-auto mb-3" />
+              <h2 className="text-xl font-bold text-green-400 mb-1">Recompensa Diária!</h2>
+              <p className="text-sm text-muted-foreground mb-1">{dailyRewardInfo.desc}</p>
+              <p className="text-lg font-bold text-amber-400 mb-4">🔥 Streak: Dia {dailyRewardInfo.streak}</p>
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                {dailyRewardInfo.rp    > 0 && <StatBox label="Reward Points" value={`+${formatNumber(dailyRewardInfo.rp)}`}    color="amber"   />}
+                {dailyRewardInfo.souls > 0 && <StatBox label="Hero Souls"    value={`+${dailyRewardInfo.souls}`}               color="purple"  />}
+                {dailyRewardInfo.gene  > 0 && <StatBox label="Gene Frags"    value={`+${dailyRewardInfo.gene}`}                color="emerald" />}
+                {dailyRewardInfo.rank  > 0 && <StatBox label="Rank Points"   value={`+${dailyRewardInfo.rank}`}                color="orange"  />}
+              </div>
+              <Button className="w-full bg-green-600 hover:bg-green-700" onClick={() => setShowDailyReward(false)}>
+                Coletar!
+              </Button>
+            </div>
+          </div>
+        )}
+        {modal === 'settings' && (
           <Modal title="Configuracoes" icon={<Settings className="w-5 h-5" />} onClose={() => setModal(null)}>
             <div className="space-y-3">
               <div className="bg-muted/30 rounded-lg p-3 text-sm space-y-1">
